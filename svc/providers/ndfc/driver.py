@@ -1,3 +1,4 @@
+from svc.providers.ndfc.exceptions import NdfcProviderError
 from svc.schemas.api_v2 import RollbackResponse, VerificationResponse
 from svc.shared.ids import new_id
 
@@ -35,12 +36,27 @@ class NdfcDriver:
         optional_failures: list[str] = []
 
         fabric = self.inventory_adapter.get_fabric(service_intent.fabric_name)
-        switches = self.inventory_adapter.get_switches(service_intent)
+
+        try:
+            switches = self.inventory_adapter.get_switches(service_intent)
+        except NdfcProviderError as error:
+            switches = []
+            if error.critical:
+                required_failures.append(error.endpoint)
+            else:
+                optional_failures.append(error.endpoint)
+
+        try:
+            policy_conflicts = self.policy_adapter.get_interface_policies(service_intent)
+        except NdfcProviderError as error:
+            policy_conflicts = []
+            if error.critical:
+                required_failures.append(error.endpoint)
+            else:
+                optional_failures.append(error.endpoint)
 
         if fabric is None:
             required_failures.append("inventory.fabric")
-
-        policy_conflicts = self.policy_adapter.get_interface_policies(service_intent)
 
         if service_intent.flags.get("simulate_optional_failure"):
             optional_failures.append("history.audit")
@@ -98,12 +114,33 @@ class NdfcDriver:
         }
 
     def apply_plan(self, plan, deployment_id):
-        jobs = [{"job_id": new_id(), "operation": operation, "status": "submitted"} for operation in plan.operations]
+        jobs = []
+        if self.deploy_adapter:
+            jobs = self.deploy_adapter.submit(deployment_id, plan.operations)
+
+        if not jobs:
+            jobs = [{"job_id": new_id(), "operation": operation, "status": "submitted"} for operation in plan.operations]
+
         return type("DeployResult", (), {"jobs": jobs})()
 
     def verify_deployment(self, deployment_id, jobs: list[dict]):
-        checks = [{"check": "job-status", "job_id": job["job_id"], "result": "ok"} for job in jobs]
+        checks = []
+        if self.verify_adapter:
+            checks = self.verify_adapter.check_jobs(deployment_id, jobs)
+
+        if not checks:
+            checks = [{"check": "job-status", "job_id": job["job_id"], "result": "ok"} for job in jobs]
+
         return VerificationResponse(deployment_id=deployment_id, status="verified", checks=checks)
 
     def rollback_deployment(self, deployment_id):
+        if self.deploy_adapter and hasattr(self.deploy_adapter, "rollback"):
+            payload = self.deploy_adapter.rollback(deployment_id)
+            if payload:
+                return RollbackResponse(
+                    deployment_id=deployment_id,
+                    rollback_id=payload.get("rollback_id", new_id()),
+                    status=payload.get("status", "accepted"),
+                )
+
         return RollbackResponse(deployment_id=deployment_id, rollback_id=new_id(), status="accepted")

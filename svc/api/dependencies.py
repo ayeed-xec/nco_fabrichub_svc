@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 from svc.core.idempotency import IdempotencyManager
 from svc.core.locks import LockManager
 from svc.core.settings import get_settings
@@ -11,6 +13,7 @@ from svc.orchestration.get_plan import GetPlan
 from svc.orchestration.get_verification import GetVerification
 from svc.orchestration.preview_plan import PreviewPlan
 from svc.orchestration.rollback_deployment import RollbackDeployment
+from svc.orchestration.verify_deployment import VerifyDeployment
 from svc.persistence.repositories.approvals import ApprovalRepository
 from svc.persistence.repositories.deployments import DeploymentRepository
 from svc.persistence.repositories.evidence import EvidenceRepository
@@ -21,6 +24,7 @@ from svc.persistence.repositories.service_orders import ServiceOrderRepository
 from svc.providers.ndfc.driver import NdfcDriver
 
 
+@lru_cache(maxsize=1)
 def _build_driver() -> NdfcDriver:
     settings = get_settings()
     return NdfcDriver.from_settings(settings)
@@ -68,11 +72,16 @@ def get_deploy_plan_use_case() -> DeployPlan:
 
 
 def get_get_deployment_use_case() -> GetDeployment:
-    return GetDeployment(deployment_repo=DeploymentRepository())
+    return GetDeployment(deployment_repo=DeploymentRepository(), evidence_repo=EvidenceRepository())
 
 
 def get_get_verification_use_case() -> GetVerification:
     return GetVerification(deployment_repo=DeploymentRepository())
+
+
+def get_verify_deployment_use_case() -> VerifyDeployment:
+    driver = _build_driver()
+    return VerifyDeployment(driver=driver, deployment_repo=DeploymentRepository())
 
 
 def get_rollback_deployment_use_case() -> RollbackDeployment:

@@ -112,6 +112,7 @@ class DeploymentResponse(BaseModel):
     plan_id: str
     status: str
     jobs: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
 
 
 class VerificationResponse(BaseModel):

@@ -5,8 +5,10 @@ from svc.core.locks import LockManager
 from svc.orchestration.approve_plan import ApprovePlan
 from svc.orchestration.create_plan import CreatePlan
 from svc.orchestration.deploy_plan import DeployPlan
+from svc.orchestration.get_deployment import GetDeployment
 from svc.orchestration.preview_plan import PreviewPlan
 from svc.orchestration.rollback_deployment import RollbackDeployment
+from svc.orchestration.verify_deployment import VerifyDeployment
 from svc.persistence.repositories.approvals import ApprovalRepository
 from svc.persistence.repositories.deployments import DeploymentRepository
 from svc.persistence.repositories.evidence import EvidenceRepository
@@ -77,6 +79,8 @@ def test_full_plan_approve_deploy_verify_and_rollback_flow():
     preview_plan = PreviewPlan(driver=driver, plan_repo=plan_repo)
     approve_plan = ApprovePlan(plan_repo=plan_repo, approval_repo=ApprovalRepository())
     deploy_plan = _build_deploy_use_case(driver, plan_repo, deployment_repo, ownership_repo, evidence_repo)
+    verify_plan = VerifyDeployment(driver=driver, deployment_repo=deployment_repo)
+    get_deployment = GetDeployment(deployment_repo=deployment_repo, evidence_repo=evidence_repo)
     rollback = RollbackDeployment(driver=driver, deployment_repo=deployment_repo, plan_repo=plan_repo)
 
     plan = create_plan.execute(_request())
@@ -91,11 +95,11 @@ def test_full_plan_approve_deploy_verify_and_rollback_flow():
     assert deployment.status == "completed"
     assert plan_repo.get(plan.plan_id).status == "deployed"
 
-    verification = deployment_repo.get_verification(deployment.deployment_id)
+    verification = verify_plan.execute(deployment.deployment_id)
     assert verification.status == "verified"
 
-    artifacts = evidence_repo.list_for_deployment(deployment.deployment_id)
-    assert len(artifacts) == 1
+    hydrated = get_deployment.execute(deployment.deployment_id)
+    assert len(hydrated.evidence_refs) == 1
 
     ownership_conflicts = ownership_repo.find_for_service_intent(_request().service_intent)
     assert ownership_conflicts == []
@@ -168,3 +172,18 @@ def test_rollback_blocked_when_newer_completed_deployment_exists():
         assert "newer completed deployment" in error.detail["message"]
         return
     raise AssertionError("Expected rollback to be blocked for older deployment")
+
+
+def test_verify_requires_completed_or_rolled_back_deployment():
+    driver = _driver()
+    deployment_repo = DeploymentRepository()
+    verify = VerifyDeployment(driver=driver, deployment_repo=deployment_repo)
+
+    pending = deployment_repo.create_pending(plan_id="plan-x", actor="actor-a")
+
+    try:
+        verify.execute(pending.deployment_id)
+    except HTTPException as error:
+        assert error.status_code == 409
+        return
+    raise AssertionError("Expected verify to be blocked for pending deployment")

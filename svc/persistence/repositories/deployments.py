@@ -59,6 +59,7 @@ class DeploymentRepository:
             plan_id=row["plan_id"],
             status=row["status"],
             jobs=json.loads(row["jobs_json"]),
+            evidence_refs=[],
         )
 
     def get_verification(self, deployment_id: str):

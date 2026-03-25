@@ -14,7 +14,7 @@ class _Driver(NdfcDriver):
                 (),
                 {
                     "get_fabric": lambda _self, name: None if name == "missing-fabric" else {"name": name},
-                    "get_switches": lambda _self, intent: [{"serial_number": e.serial_number} for e in intent.endpoints],
+                    "get_switches": lambda _self, intent: (_raise_switch_error() if intent.flags.get("simulate_switch_probe_failure") else [{"serial_number": e.serial_number} for e in intent.endpoints]),
                     "list_fabrics": lambda _self: [{"name": "fab-1", "state": "managed"}],
                 },
             )(),
@@ -40,6 +40,12 @@ class _DeploymentRepo:
 
     def has_inflight_for_service(self, service_key: str) -> bool:
         return self.has_inflight
+
+
+def _raise_switch_error():
+    from svc.providers.ndfc.exceptions import NdfcProviderError
+
+    raise NdfcProviderError("switch probe failed", endpoint="inventory.switches", critical=True)
 
 
 def _request(**flags):
@@ -99,3 +105,10 @@ def test_preflight_blocks_on_inflight_deployment_lock():
     response = use_case.execute(_request())
     assert response.status == "blocked"
     assert any(conflict.code == "INFLIGHT_DEPLOYMENT_LOCK" for conflict in response.conflicts)
+
+
+def test_preflight_blocks_on_required_probe_failure():
+    use_case = CreatePreflight(driver=_Driver.build(), ownership_repo=OwnershipRepository())
+    response = use_case.execute(_request(simulate_switch_probe_failure=True))
+    assert response.status == "blocked"
+    assert any(conflict.code == "CONTROLLER_UNCERTAINTY" for conflict in response.conflicts)
