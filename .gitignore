@@ -1,0 +1,302 @@
+include:
+  - template: Security/Container-Scanning.latest.gitlab-ci.yml
+  - template: Jobs/Dependency-Scanning.latest.gitlab-ci.yml
+  #- template: Jobs/License-Scanning.latest.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.latest.gitlab-ci.yml
+  
+.merge_request_rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main" ||  $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master")
+      when: on_success
+
+.branch_push_rules:
+  rules:
+    - if:  $CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master")
+      when: on_success
+
+.tag_creation_rules:
+  rules:
+    - if:  $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ '/^v.*/'
+      when: on_success
+
+.web_request_build_rules:
+  rules:
+    - if:  $CI_PIPELINE_SOURCE == "web" && $ENV != "nc_test" && $ENV != "nc_prod"
+      when: on_success
+
+.web_request_analysis_rules:
+  rules:
+    - if:  $CI_PIPELINE_SOURCE == "web" && $RUN_ANALYSIS == "true"
+      when: on_success
+
+.web_request_ec_dev_deploy_rules:
+  rules:
+    - if:  $CI_PIPELINE_SOURCE == "web" && $ENV == "ec_dev"
+      when: on_success
+
+.web_request_nc_dev_deploy_rules:
+  rules:
+    - if:  $CI_PIPELINE_SOURCE == "web" && $ENV == "nc_dev"
+      when: on_success
+
+.web_request_nc_test_deploy_rules:
+  rules:
+    - if:  $CI_PIPELINE_SOURCE == "web" && $ENV == "nc_test" && $CI_COMMIT_TAG =~ '/^v.*/'
+      when: on_success
+
+.web_request_nc_prod_deploy_rules:
+  rules:
+    - if:  $CI_PIPELINE_SOURCE == "web" && $ENV == "nc_prod" && $CI_COMMIT_TAG =~ '/^v.*/'
+      when: on_success
+
+default:
+  services:
+    - name: $DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/common/docker:24.0.7-dind
+      alias: docker
+      command: ["--tls=false"]      
+  tags:
+    - ncso_builder
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG != null
+      variables:
+        IMAGE_NAME: "$DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/release/$CI_PROJECT_NAME:$CI_COMMIT_TAG"
+        DOCKER_HOST: tcp://docker:2375
+        DOCKER_TLS_CERTDIR: ""
+    - if: $CI_COMMIT_TAG == null
+      variables:
+        IMAGE_NAME: "$DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/$CI_PROJECT_NAME:$CI_COMMIT_SHORT_SHA"
+        DOCKER_HOST: tcp://docker:2375
+        DOCKER_TLS_CERTDIR: ""
+
+stages:
+  - linter
+  #- unit-tests
+  - sonarQube
+  - build-and-push-image
+  - test  
+  - deploy
+
+
+linter:
+  stage: linter
+  image: $DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/common/python:3.11.6
+  script:
+    - pip install pylama
+    - pip uninstall pyflakes -y
+    - pylama .
+  when: always
+  rules:
+    - !reference [.merge_request_rules, rules]
+    - !reference [.branch_push_rules, rules]
+    - !reference [.tag_creation_rules, rules]
+    - !reference [.web_request_build_rules, rules]
+
+#unit-test:
+#  stage: unit-tests
+#  image: $DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/common/python:3.11.6
+#  script:
+#    - pytest --cov=. --cov-report xml --junitxml test-results.xml tests
+#    - coverage xml --omit="test_*"
+#  before_script:
+#    - pip install "corelib==2.3.3" --extra-index-url https://token:$PIP_TOKEN@gitlab.prod.ec.devops.nat.bt.com/api/v4/projects/117441/packages/pypi/simple --proxy="http://cloudproxy-d.nat.bt.com:8080"
+#    - pip install -r requirements.txt
+#    - pip install pytest requests coverage
+#  artifacts:
+#    paths:
+#      - coverage.xml
+#      - test-results.xml
+#    expire_in: 1 day
+#  when: always
+#  rules:
+#    - !reference [.merge_request_rules, rules]
+#    - !reference [.branch_push_rules, rules]
+#    - !reference [.tag_creation_rules, rules]
+#    - !reference [.web_request_build_rules, rules]
+
+sonarQube:
+  stage: sonarQube
+  image:  $DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/common/sonarscannernode-6.0.0.4432:jdk20
+  script:
+    - |
+        if $SONAR_PROXY_REQUIRED == "true"; then
+            echo "Setting proxy for Sonar"
+            export SONAR_SCANNER_OPTS="-Dhttps.proxyHost=cloudproxy.nat.bt.com -Dhttps.proxyPort=8080"
+        fi
+    - >
+      sonar-scanner
+      -Dsonar.projectKey=$CI_PROJECT_NAME
+      -Dsonar.projectName=$CI_PROJECT_NAME
+      -Dsonar.sources=svc
+      -Dsonar.exclusions=tests
+      -Dsonar.tests=tests
+      -Dsonar.projectVersion=v1.0
+      -Dsonar.host.url=$SONAR_URL
+      -Dsonar.login=$SONAR_LOGIN
+      -Dsonar.links.ci=$CI_JOB_URL
+      -Dsonar.qualitygate.wait=true
+      -Dsonar.python.coverage.reportPaths=coverage.xml
+      -Dsonar.python.xunit.reportPath=test-results.xml
+  when: always
+  allow_failure: true  
+  rules:
+    - !reference [.merge_request_rules, rules]
+    - !reference [.branch_push_rules, rules]
+    - !reference [.tag_creation_rules, rules]
+    - !reference [.web_request_build_rules, rules]
+
+build-and-push-image:
+  stage: build-and-push-image
+  image: $DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/common/docker:20.10.10  
+  before_script:
+    - docker login -u $DOCKER_REGISTRY_USER -p $DOCKER_REGISTRY_PASSWORD $DOCKER_REGISTRY_URL
+  script:
+    - echo "Building image"
+    - export DOCKER_BUILDKIT=0    
+    - docker build --no-cache --build-arg PIP_TOKEN=$PIP_TOKEN --build-arg MINIO_HOST_URL --build-arg MINIO_ACCESS_KEY --build-arg MINIO_SECRET_KEY -t $IMAGE_NAME .
+    - docker push $IMAGE_NAME
+  allow_failure: false
+  rules:
+    - !reference [.merge_request_rules, rules]
+    - !reference [.branch_push_rules, rules]
+    - !reference [.tag_creation_rules, rules]
+    - !reference [.web_request_build_rules, rules]
+
+container_scanning:
+  variables:
+    CS_IMAGE: "$IMAGE_NAME"
+    CS_REGISTRY_USER: "$DOCKER_REGISTRY_USER"
+    CS_REGISTRY_PASSWORD: "$DOCKER_REGISTRY_PASSWORD"
+    CS_DOCKER_INSECURE: "true"
+  rules:
+    - !reference [.merge_request_rules, rules]
+    - !reference [.branch_push_rules, rules]
+    - !reference [.tag_creation_rules, rules]
+    - !reference [.web_request_analysis_rules, rules]
+
+gemnasium-python-dependency_scanning:
+  rules:
+    - !reference [.merge_request_rules, rules]
+    - !reference [.branch_push_rules, rules]
+    - !reference [.tag_creation_rules, rules]
+    - !reference [.web_request_analysis_rules, rules]
+
+#license_scanning:
+#  rules:
+#    - !reference [.merge_request_rules, rules]
+#    - !reference [.branch_push_rules, rules]
+#    - !reference [.tag_creation_rules, rules]
+#    - !reference [.web_request_analysis_rules, rules]
+
+secret_detection:
+  rules:
+    - !reference [.merge_request_rules, rules]
+    - !reference [.branch_push_rules, rules]
+    - !reference [.tag_creation_rules, rules]
+    - !reference [.web_request_analysis_rules, rules]
+
+deploy_to_ec_dev:
+  stage: deploy
+  environment: 
+    deployment_tier: development
+    name: dev2
+  image:
+    name: $DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/common/k8_envsubt:latest
+    entrypoint: [""]
+  script:
+    - kubectl config set-cluster deploy-cluster --server="$K8_EC_DEV_SERVER" --insecure-skip-tls-verify
+    - kubectl config set-credentials gitlab --token=$(echo $K8_EC_DEV_TOKEN | base64 -d)
+    - kubectl config set-context deploy-cluster --cluster=deploy-cluster --namespace=$K8_EC_DEV_NAMESPACE --user=gitlab
+    - kubectl config use-context deploy-cluster    
+    - NAMESPACE=$K8_EC_DEV_NAMESPACE TAG=$CI_COMMIT_SHORT_SHA DOCKER_IMAGE_NAME=$IMAGE_NAME envsubst < kube-manifest.yml > deploy.yaml
+    - kubectl apply -f deploy.yaml
+  rules:
+    - !reference [.merge_request_rules, rules]
+    - !reference [.branch_push_rules, rules]
+    - !reference [.web_request_ec_dev_deploy_rules, rules]
+
+deploy_to_nc_dev:
+  tags:
+    - ncso_nc_dev_test_deployer_new  
+  stage: deploy
+  environment: 
+    deployment_tier: testing
+    name: dev1
+  image:
+    name: $DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/common/k8_envsubt:latest
+    entrypoint: [""]
+  script:
+    - kubectl config set-cluster deploy-cluster --server="$K8_NC_DEV_SERVER_NEW" --insecure-skip-tls-verify
+    - kubectl config set-credentials gitlab --token=$(echo $K8_NC_DEV_TOKEN_NEW | base64 -d)
+    - kubectl config set-context deploy-cluster --cluster=deploy-cluster --namespace=$K8_NC_DEV_NAMESPACE --user=gitlab
+    - kubectl config use-context deploy-cluster
+    - unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy    
+    - NAMESPACE=$K8_NC_DEV_NAMESPACE TAG=$CI_COMMIT_SHORT_SHA DOCKER_IMAGE_NAME=$IMAGE_NAME envsubst < kube-manifest.yml > deploy.yaml
+    - kubectl apply -f deploy.yaml
+  rules:
+    - !reference [.tag_creation_rules, rules]
+    - !reference [.web_request_nc_dev_deploy_rules, rules]
+
+deploy_to_nc_test:
+  tags:
+    - ncso_nc_dev_test_deployer_new  
+  stage: deploy
+  environment: 
+    deployment_tier: testing
+    name: test1
+  image:
+    name: $DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/common/k8_envsubt:latest
+    entrypoint: [""]
+  script:
+    - kubectl config set-cluster deploy-cluster --server="$K8_NC_TEST_SERVER_NEW" --insecure-skip-tls-verify
+    - kubectl config set-credentials gitlab --token=$(echo $K8_NC_TEST_TOKEN_NEW | base64 -d)
+    - kubectl config set-context deploy-cluster --cluster=deploy-cluster --namespace=$K8_NC_TEST_NAMESPACE --user=gitlab
+    - kubectl config use-context deploy-cluster
+    - unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy    
+    - NAMESPACE=$K8_NC_TEST_NAMESPACE TAG=$CI_COMMIT_SHORT_SHA DOCKER_IMAGE_NAME=$IMAGE_NAME envsubst < kube-manifest.yml > deploy.yaml
+    - kubectl apply -f deploy.yaml
+  rules:
+    - !reference [.web_request_nc_test_deploy_rules, rules]
+
+deploy_to_nc_cth02:
+  tags:
+    - ncso_nc_prod_deployer_cth02  
+  stage: deploy
+  environment: 
+    deployment_tier: production
+    name: prod1
+  image:
+    name: $DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/common/k8_envsubt:latest
+    entrypoint: [""]
+  script:
+    - kubectl config set-cluster deploy-cluster --server="$K8_NC_CTH02_SERVER" --insecure-skip-tls-verify
+    - kubectl config set-credentials gitlab --token=$(echo $K8_NC_CTH02_TOKEN | base64 -d)
+    - kubectl config set-context deploy-cluster --cluster=deploy-cluster --namespace=$K8_NC_PROD_NAMESPACE --user=gitlab
+    - kubectl config use-context deploy-cluster
+    - unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy    
+    - NAMESPACE=$K8_NC_PROD_NAMESPACE TAG=$CI_COMMIT_SHORT_SHA DOCKER_IMAGE_NAME=$IMAGE_NAME envsubst < kube-manifest.yml > deploy.yaml
+    - kubectl apply -f deploy.yaml
+  rules:
+    - !reference [.web_request_nc_prod_deploy_rules, rules]
+
+deploy_to_nc_cth03:
+  tags:
+    - ncso_nc_prod_deployer_cth03  
+  stage: deploy
+  environment: 
+    deployment_tier: production
+    name: prod1
+  image:
+    name: $DOCKER_REGISTRY_URL/$DOCKER_REGISTRY_REPOSITORY/common/k8_envsubt:latest
+    entrypoint: [""]
+  script:
+    - kubectl config set-cluster deploy-cluster --server="$K8_NC_CTH03_SERVER" --insecure-skip-tls-verify
+    - kubectl config set-credentials gitlab --token=$(echo $K8_NC_CTH03_TOKEN | base64 -d)
+    - kubectl config set-context deploy-cluster --cluster=deploy-cluster --namespace=$K8_NC_PROD_NAMESPACE --user=gitlab
+    - kubectl config use-context deploy-cluster
+    - unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy    
+    - NAMESPACE=$K8_NC_PROD_NAMESPACE TAG=$CI_COMMIT_SHORT_SHA DOCKER_IMAGE_NAME=$IMAGE_NAME envsubst < kube-manifest.yml > deploy.yaml
+    - kubectl apply -f deploy.yaml
+  rules:
+    - !reference [.web_request_nc_prod_deploy_rules, rules]
